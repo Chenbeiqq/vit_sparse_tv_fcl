@@ -1,4 +1,4 @@
-python 3.10.16 /n
+python 3.10.16
 tensorboard             2.18.0
 tensorboard-data-server 0.7.2
 tensorboardX            2.6.2.2
