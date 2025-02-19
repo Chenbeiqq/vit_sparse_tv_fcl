@@ -92,6 +92,9 @@ def build_subset_classification_head(model, dataset_name, classes, data_location
 
     classification_head = ClassificationHead(normalize=True, weights=zeroshot_weights)
 
+    model = model.cpu()
+    torch.cuda.empty_cache()
+
     return classification_head
 
 

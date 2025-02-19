@@ -1,23 +1,24 @@
 import copy
-from datetime import datetime
-import pandas as pd
-import numpy as np
-import torch
-from torch.utils.data import DataLoader
 import os
-from src.localize_utils import  Stitcher
-from client import LocalUpdate
-from src.cl_utils import get_dataset_and_classifier_for_split, create_non_iid_dataloaders,create_non_iid_dataloaders_with_val
-from src.datasets.common import maybe_dictionarize, get_dataloader
-from src.datasets.registry import get_dataset, create_k_shot_dataset
-from src.heads import get_classification_head
-from src.merging.task_vectors import merge_max_abs
-from src.modeling import ImageClassifier, ImageEncoder
-from src.utils import get_logits
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import torch
 import tqdm
+
+from client import LocalUpdate
+from src.cl_utils import get_dataset_and_classifier_for_split, create_non_iid_dataloaders_with_val
+from src.datasets.common import maybe_dictionarize, get_dataloader
+from src.datasets.registry import get_dataset
+from src.heads import get_classification_head
+from src.localize_utils import Stitcher
+from src.modeling import ImageClassifier
+
+
 class vit_sparse_tv:
-    def __init__(self,args,image_encoder,dataset_name,device,task_num,client,
-                 all_client,trainable_params,frozen):
+    def __init__(self, args, image_encoder, dataset_name, device, task_num, client,
+                 all_client, trainable_params, frozen):
         self.args = args
         self.dataset_name = dataset_name
         self.tv = None
@@ -29,7 +30,7 @@ class vit_sparse_tv:
         self.device = device
         self.dataset = None
         self.task_sub_dataset = None
-        #task num denote a task include classes
+        # task num denote a task include classes
         self.task_num = task_num
         self.epochs = args.epochs
         self.list_of_testloader = []
@@ -42,46 +43,54 @@ class vit_sparse_tv:
         self.client_sparse_tv = []
         self.trainable_params = trainable_params
         self.frozen = frozen
+
     # def get_trainable_param_for_image_encoder(self):
     #
-    def federated_class_continual_eval(self,idx):
-        test_classification_head = get_classification_head(self.args,self.dataset_name,self.global_image_encoder,classnames=self.classnames)
-        model = ImageClassifier(self.global_image_encoder,test_classification_head)
+    def federated_class_continual_eval(self, idx):
+        test_classification_head = get_classification_head(self.args, self.dataset_name, self.global_image_encoder,
+                                                           classnames=self.classnames)
+        model = ImageClassifier(self.global_image_encoder, test_classification_head)
 
         accs = []
         for split_idx in range(idx + 1):
             dataset = copy.deepcopy(self.dataset)
             dataset = get_dataset_and_classifier_for_split(
-                dataset, split_idx, None, self.args, remap_labels=False, return_classifier=False,classnames=self.classnames
+                dataset, split_idx, None, self.args, remap_labels=False, return_classifier=False,
+                classnames=self.classnames
             )
-            metrics = self.do_eval(model,dataset.test_loader, self.device)
+            metrics = self.do_eval(model, dataset.test_loader, self.device)
             accs.append(metrics['top1'])
             print(f"Task eval on split {split_idx} of dataset {self.dataset_name}. Accuracy: {accs[-1]}")
 
         return accs
 
     @torch.no_grad()
-    def do_eval(self, model,dl, device):
+    def do_eval(self, model, dl, device):
         correct, n = 0., 0.
         model.eval()
+        model = model.to(device)
         for data in tqdm.tqdm(dl):
             data = maybe_dictionarize(data)
             x = data['images'].to(device)
             y = data['labels'].to(device)
 
-            logits = get_logits(x, model)
+            # logits = get_logits(x, model) # 将模型转换为对应到对应的设备上并进行推理
+            logits = model(x)
             pred = logits.argmax(dim=1, keepdim=True).to(device)
             correct += pred.eq(y.view_as(pred)).sum().item()
             n += y.size(0)
+        model = model.to("cpu")  # 完成验证后释放显存
+        torch.cuda.empty_cache()
 
         metrics = {'top1': correct / n}
 
         return metrics
-    def save_checkpoint(self,current_task):
-        image_encoder_ft = os.path.join(self.global_image_encoder_ft,f'image_encoder_{current_task}.pt')
+
+    def save_checkpoint(self, current_task):
+        image_encoder_ft = os.path.join(self.global_image_encoder_ft, f'image_encoder_{current_task}.pt')
         self.global_image_encoder.save(image_encoder_ft)
 
-    def save_stats_to_excel(self,stats_dict,current_task,excel_path='sparse_merge_stats.xlsx'):
+    def save_stats_to_excel(self, stats_dict, current_task, excel_path='sparse_merge_stats.xlsx'):
         """
         将合并统计信息保存到Excel文件，支持追加新数据
 
@@ -128,7 +137,8 @@ class vit_sparse_tv:
             backup_path = f'sparse_merge_stats_backup_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
             new_df.to_excel(backup_path, index=False)
             print(f"已保存备份文件到 {backup_path}")
-    def setup_data(self,n_shot):
+
+    def setup_data(self, n_shot):
         assert self.dataset_name is not None, "please provide a dataset for training"
         self.dataset = get_dataset(
             self.dataset_name,
@@ -138,37 +148,40 @@ class vit_sparse_tv:
         )
         self.classnames = self.dataset.classnames
 
-    def setup_task_data_and_classification_head(self,current_task):
-        #检查是否已存在过去训练的image_encoder,要做到sequential finetuning
+    def setup_task_data_and_classification_head(self, current_task):
+        # 检查是否已存在过去训练的image_encoder,要做到sequential finetuning
         if os.path.exists(os.path.join(self.global_image_encoder_ft, f'image_encoder_{current_task}.pt')):
             print(f"Skipping finetuning on split {current_task}, "
                   f"ckpt already exists under {os.path.join(self.global_image_encoder_ft, f'image_encoder_{current_task}.pt')}")
             return True
-        if current_task>0:
-            prev_image_encoder_ft = os.path.join(self.global_image_encoder_ft, f'image_encoder_{current_task-1}.pt')
+        if current_task > 0:
+            prev_image_encoder_ft = os.path.join(self.global_image_encoder_ft, f'image_encoder_{current_task - 1}.pt')
             print(f'Loading image encoder from prev task {prev_image_encoder_ft=}')
-            self.global_image_encoder = torch.load(prev_image_encoder_ft)
-            #denote  pass this task process
+            self.global_image_encoder = torch.load(prev_image_encoder_ft, weights_only=False)
+            # denote  pass this task process
         dataset = copy.deepcopy(self.dataset)
-        #构建任务分类头
+        # 构建任务分类头
         self.task_sub_dataset, self.classification_head = get_dataset_and_classifier_for_split(
-            dataset, current_task, self.global_image_encoder, self.args,classnames=self.classnames
+            dataset, current_task, self.global_image_encoder, self.args, classnames=self.classnames
         )
-        self.global_model = ImageClassifier(self.global_image_encoder,self.classification_head)
+        self.global_model = ImageClassifier(self.global_image_encoder, self.classification_head)
         self.global_model.freeze_head()
         self.global_model.freeze_lang()
         return False
+
     #
     # def beforeTrain(self,current_task):
     #     self.setup_task_data_and_classification_head(current_task)
 
-    def train(self,current_task):
+    def train(self, current_task):
         train_data_loader = get_dataloader(self.task_sub_dataset, is_train=True, args=self.args, image_encoder=None)
-        user_groups_loader,user_groups_valloader = create_non_iid_dataloaders_with_val(train_data_loader,n_parties=self.select_client,beta=0.5)
+        user_groups_loader, user_groups_valloader = create_non_iid_dataloaders_with_val(train_data_loader,
+                                                                                        n_parties=self.select_client,
+                                                                                        beta=0.5)
         idxs_users = np.random.choice(range(self.args.num_users), self.select_client, replace=False)
         map_dict = {}
         map_dict_val = {}
-        for (key,value),new_key in zip(user_groups_loader.items(),idxs_users):
+        for (key, value), new_key in zip(user_groups_loader.items(), idxs_users):
             map_dict[new_key] = value
         for (key, value), new_key in zip(user_groups_valloader.items(), idxs_users):
             map_dict_val[new_key] = value
@@ -177,30 +190,44 @@ class vit_sparse_tv:
 
         for idx in idxs_users:
             print(f'client {idx} in {self.dataset_name}-task{current_task}')
-            client = LocalUpdate(self.args,user_groups_loader[idx],self.trainable_params,n_shot=self.args.n_shot,val_dataloader=user_groups_valloader[idx])
-            client_model = copy.deepcopy(self.global_model)
-            self.client_sparse_tv.append(client.local_train(client_model))
+            client_start_time = datetime.now()
 
-        #aggregation client task vector
+            client = LocalUpdate(self.args, user_groups_loader[idx], self.trainable_params, n_shot=self.args.n_shot,
+                                 val_dataloader=user_groups_valloader[idx])
+            client_model = copy.deepcopy(self.global_model)
+            client.local_train(client_model)
+            local_model = client.afterTrain()
+            self.client_sparse_tv.append(local_model)
+
+            client_end_time = datetime.now()
+            print(
+                f'client {idx} in {self.dataset_name}-task{current_task} cost time: {client_end_time - client_start_time}')
+            # self.client_sparse_tv.append(client.local_train(client_model))
+
+        # aggregation client task vector
         if current_task == 0:
-            merged_client_sparse_tv = Stitcher(self.client_sparse_tv,self.trainable_params,self.args,None,self.frozen)
+            merged_client_sparse_tv = Stitcher(self.client_sparse_tv, self.trainable_params, self.args, None,
+                                               self.frozen)
         else:
-            merged_client_sparse_tv = Stitcher(self.client_sparse_tv,self.trainable_params,self.args,self.tv,self.frozen)
+            merged_client_sparse_tv = Stitcher(self.client_sparse_tv, self.trainable_params, self.args, self.tv,
+                                               self.frozen)
         self.tv = merged_client_sparse_tv.merge_dense_tvs()
         # self.save_stats_to_excel(status,current_task)
         # 打印每层的重复统计信息
 
-        self.global_image_encoder = merged_client_sparse_tv.apply_dense_tv_to_model(self.tv,scaling_coef=0.5)
+        self.global_image_encoder = merged_client_sparse_tv.apply_dense_tv_to_model(self.tv, scaling_coef=0.5)
 
         # merged_tv = merge_max_abs(local_client_tv)
         # self.global_image_encoder = merged_tv.apply_to(self.args.pretrained_checkpoint, scaling_coef=0.5)
         # self.tv = merged_tv
 
         self.save_checkpoint(current_task)
-    def afterTrain(self,current_task):
+
+    def afterTrain(self, current_task):
         print('#' * 100 + "\nPerforming old task evaluation of federated continual learning .")
         results = []
-        print(f"\nEVAL: {self.dataset_name}-{self.args.n_splits} (federated {self.args.split_strategy} incremental) - split idx: {current_task}")
+        print(
+            f"\nEVAL: {self.dataset_name}-{self.args.n_splits} (federated {self.args.split_strategy} incremental) - split idx: {current_task}")
         res = self.federated_class_continual_eval(current_task)
         results.append(res)
         print(f" eval on {self.dataset_name} after task {current_task}. Accuracies:\n{res}")

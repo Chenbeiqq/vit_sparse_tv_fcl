@@ -1,11 +1,10 @@
 import torch
 import torch.nn as nn
-import numpy as np
 from tqdm import tqdm
+
 from src.datasets.common import maybe_dictionarize
-from src.eval import evaluate
-from src.modeling import ImageClassifier
 from src.heads import get_classification_head
+from src.modeling import ImageClassifier
 from src.utils import get_logits
 
 
@@ -31,12 +30,12 @@ class Localizer(nn.Module):
         self.model_type = model_type
 
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        self.model.to(self.device)
+        self.model.to("cpu")
         if self.model_type == "vit":
             print("Using Vision Transformer Classifier Head")
             self.classifier_head = classifier_head if classifier_head is not None else get_classification_head(
                 self.args, dataset_name)
-            self.classifier_head.to(self.device)
+            self.classifier_head.to("cpu")
 
         self.pretrained_model.to("cpu")
         self.finetuned_model.to("cpu")
@@ -49,12 +48,12 @@ class Localizer(nn.Module):
         for param in self.finetuned_model.parameters():
             param.requires_grad = False
         # Move tensors to the appropriate device
-        self.pretrained_state_dict = {key: value.to(self.device) for key, value in
+        self.pretrained_state_dict = {key: value.to("cpu") for key, value in
                                       pretrained_model.state_dict().items()}
 
         # 将 finetuned_state_dict 中的每个 tensor 移动到正确的设备
-        self.finetuned_state_dict = {key: value.to(self.device) for key, value in finetuned_model.state_dict().items()}
-        self.model_state_dict = {key: value.to(self.device) for key, value in model.state_dict().items()}
+        self.finetuned_state_dict = {key: value.to("cpu") for key, value in finetuned_model.state_dict().items()}
+        self.model_state_dict = {key: value.to("cpu") for key, value in model.state_dict().items()}
 
         self.create_binary_masks()
         self.mask = self.create_basepatch()
@@ -66,7 +65,7 @@ class Localizer(nn.Module):
         for n in self.params:
             self.trainable_name += [n]
             p = self.params[n]
-            self.trainable_parameters += [torch.rand_like(p.data, device=self.device, requires_grad=False)]
+            self.trainable_parameters += [torch.rand_like(p.data, device=torch.device("cpu"), requires_grad=False)]
 
         self.num_params = sum([p.numel() for p in self.trainable_parameters])
 
@@ -74,7 +73,8 @@ class Localizer(nn.Module):
 
         for key in self.trainable_name:
             # print(pretrained_state_dict[key].dtype)
-            if key in self.pretrained_state_dict and key in self.finetuned_state_dict and self.pretrained_state_dict[key].dtype in [torch.int64, torch.uint8]:
+            if key in self.pretrained_state_dict and key in self.finetuned_state_dict and self.pretrained_state_dict[
+                key].dtype in [torch.int64, torch.uint8]:
                 print(f"Key {key} has dtype {self.pretrained_state_dict[key].dtype} -- skipping!")
                 continue
             self.task_vector[key] = (self.finetuned_state_dict[key] - self.pretrained_state_dict[key])
@@ -84,6 +84,7 @@ class Localizer(nn.Module):
             for name in self.trainable_name:
                 if name in self.pretrained_state_dict and name in self.model_state_dict:
                     pretensor = self.pretrained_state_dict[name].to(self.device)
+                    # self.model_state_dict[name] = self.model_state_dict[name].to(self.device)
                     self.model_state_dict[name] += (pretensor - self.model_state_dict[name])
 
     def create_basepatch(self):
@@ -135,7 +136,7 @@ class Localizer(nn.Module):
                 if key in self.pretrained_state_dict and key in self.finetuned_state_dict and key in self.model_state_dict:
                     pretensor = self.pretrained_state_dict[key].to(self.device)
                     finetensor = self.finetuned_state_dict[key].to(self.device)
-                    p = self.model_state_dict[key]
+                    p = self.model_state_dict[key].to(self.device)
 
                     frac = sigmoid(self.mask[key])
                     if round_:
@@ -144,9 +145,6 @@ class Localizer(nn.Module):
                     n_graft_params += torch.sum(frac)
                     frac = frac.to(self.device)
                     p += frac * (finetensor - pretensor)
-
-
-
 
         if round_:
             print('Proportion in my graft: ', n_graft_params / self.num_params)
@@ -204,18 +202,22 @@ class Localizer(nn.Module):
             idx = torch.nonzero(m, as_tuple=True)
             if idx[0].numel() == 0:
                 continue  # 如果索引为空，跳过该张量
-            idx = [i.to(tv.device) for i in idx]
+            idx = [i.to("cpu") for i in idx]
             val = tv[idx]
             sparse_vector[key] = {'indices': idx, 'values': val}
 
         return sparse_vector
 
-    def train_graft(self, dataloader, dataset_name):
+    def train_graft(self, dataloader, dataset_name, accumulation_steps):
         loss_fct = torch.nn.CrossEntropyLoss()
         sigmoid = torch.nn.Sigmoid()
 
         device = self.device
         lr = self.graft_args.learning_rate
+        self.model = self.model.to(device)
+        self.classifier_head = self.classifier_head.to(device)
+        for key in self.model_state_dict:
+            self.model_state_dict[key] = self.model_state_dict[key].to(device)
 
         for epoch in tqdm(range(self.graft_args.num_train_epochs), 'Training the mask'):
             print("Epoch: ", epoch)
@@ -223,7 +225,8 @@ class Localizer(nn.Module):
 
             self.interpolate_model(round_=True)
 
-            for data in dataloader:
+            for i, data in enumerate(dataloader):
+                step = i + epoch * len(dataloader)
                 if self.model_type == 'vit':
                     data = maybe_dictionarize(data)
                     x = data['images'].to(self.device)
@@ -232,26 +235,28 @@ class Localizer(nn.Module):
                     outputs = self.classifier_head(features)
                     loss = loss_fct(outputs, y)
 
+                loss /= accumulation_steps
                 loss.backward()
 
-                null_grad_trainable_name = []
-                for n, p in self.model.named_parameters():
-                    if n in self.trainable_name and p.grad is None:
-                        null_grad_trainable_name.append(n)
+                if step % accumulation_steps == 0:
+                    null_grad_trainable_name = []
+                    for n, p in self.model.named_parameters():
+                        if n in self.trainable_name and p.grad is None:
+                            null_grad_trainable_name.append(n)
 
-                grad = {}
-                for n, p in self.model.named_parameters():
-                    if n in self.trainable_name and n not in null_grad_trainable_name:
-                        grad[n] = p.grad.detach().clone()
-                    elif n in self.trainable_name and n in null_grad_trainable_name:
-                        grad[n] = torch.zeros_like(p).detach().clone()
-                self.model.zero_grad()
-                for n in grad:
-                    grad[n] = grad[n] * self.task_vector[n].to(device)
-                    if n not in total_grad:
-                        total_grad[n] = lr * grad[n]
-                    else:
-                        total_grad[n] += lr * grad[n]
+                    grad = {}
+                    for n, p in self.model.named_parameters():
+                        if n in self.trainable_name and n not in null_grad_trainable_name:
+                            grad[n] = p.grad.detach().clone()
+                        elif n in self.trainable_name and n in null_grad_trainable_name:
+                            grad[n] = torch.zeros_like(p).detach().clone()
+                    self.model.zero_grad()
+                    for n in grad:
+                        grad[n] = grad[n] * self.task_vector[n].to(device)
+                        if n not in total_grad:
+                            total_grad[n] = lr * grad[n]
+                        else:
+                            total_grad[n] += lr * grad[n]
 
             for n in total_grad:
                 total_grad[n] /= len(dataloader)
@@ -261,7 +266,7 @@ class Localizer(nn.Module):
             # Take the gradient step
             with torch.no_grad():
                 for n in self.mask:
-                    p = self.mask[n]
+                    p = self.mask[n].to(self.device)
                     g = total_grad[n]
                     derivative = sigmoid(p) * (1 - sigmoid(p))
                     reg_term = self.graft_args.l1_strength * torch.where(p > 0, derivative, -derivative)
@@ -277,23 +282,27 @@ class Localizer(nn.Module):
         # 根据mask对task vector进行操作，保留我需要的值
 
         sparse_vector = self.compress_task_vector()
+        for key in self.model_state_dict:
+            self.model_state_dict[key] = self.model_state_dict[key].to("cpu")
+        self.model = self.model.to("cpu")
+        self.classifier_head = self.classifier_head.to("cpu")
+        torch.cuda.empty_cache()
 
         return sparse_vector
 
 
 class Stitcher(nn.Module):
-    def __init__(self, client_sparse_tv,trainable_params,args,later_tv,frozen):
+    def __init__(self, client_sparse_tv, trainable_params, args, later_tv, frozen):
         super(Stitcher, self).__init__()
         self.params = trainable_params
-        self.pretrained_model = torch.load(args.pretrained_checkpoint,weights_only=False)
+        self.pretrained_model = torch.load(args.pretrained_checkpoint, weights_only=False)
         self.client_sparse_tvs = client_sparse_tv
         self.previous_merged_tv = later_tv
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         self.frozen = frozen
         self.model_shapes = {k: v.shape for k, v in self.pretrained_model.state_dict().items()}
 
-
-    def merge_dense_tvs(self) :
+    def merge_dense_tvs(self):
 
         # 初始化结果字典，用于存储合并后的密集向量
         merged_dense = {}
@@ -307,7 +316,7 @@ class Stitcher(nn.Module):
             # 否则创建新的零张量
             for layer_name, shape in self.model_shapes.items():
                 if layer_name not in self.frozen:
-                    merged_dense[layer_name] = torch.zeros(shape, dtype=torch.float32,device=self.device)
+                    merged_dense[layer_name] = torch.zeros(shape, dtype=torch.float32, device=self.device)
         # 为每一层创建零张量
 
         # 遍历每个任务向量，累积到密集向量中
@@ -322,7 +331,7 @@ class Stitcher(nn.Module):
                 index_tuple = tuple(indices for indices in data['indices'])
                 # 比较现有值和新值的绝对值，保留较大者
                 current_values = dense_tensor[index_tuple]
-                new_values = data['values']
+                new_values = data['values'].to(self.device)
                 mask = torch.abs(new_values) > torch.abs(current_values)
 
                 # 更新密集向量中的值（只在mask为True的位置更新）
@@ -334,34 +343,14 @@ class Stitcher(nn.Module):
 
         model_state_dict = self.pretrained_model.state_dict()
         model_state_dict = {key: value.to(self.device) for key, value in
-                                    model_state_dict.items()}
+                            model_state_dict.items()}
         dense_tv = {key: value.to(self.device) for key, value in
-                                    dense_tv.items()}
+                    dense_tv.items()}
         for key, dense_tensor in dense_tv.items():
             model_state_dict[key].add_(scaling_coef * dense_tensor)
 
         self.pretrained_model.load_state_dict(model_state_dict)
         return self.pretrained_model
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     # def merge_sparse_tvs(self):
     #     """
