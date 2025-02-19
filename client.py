@@ -82,8 +82,8 @@ class LocalUpdate(object):
                 if step % print_every == 0 or i + 1 == n_batch:
                     percent_complete = 100 * i / len(self.trainloader)
                     client_logger.debug(
-                        f"Train Epoch: {epoch} [{percent_complete:.0f}% {i}/{len(self.trainloader)}]\t"
-                        f"Loss: {loss.item():.6f}\tData (t) {data_time:.3f}\tBatch (t) {batch_time:.3f}", flush=True
+                        f"Train Epoch: {epoch} [{percent_complete:.0f}% {i}/{len(self.trainloader)}]\t"+
+                        f"Loss: {loss.item():.6f}\tData (t) {data_time:.3f}\tBatch (t) {batch_time:.3f}"
                     )
 
         client_model = client_model.to("cpu") # 释放显存
