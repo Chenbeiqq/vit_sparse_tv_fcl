@@ -6,7 +6,9 @@ import torch
 from src.datasets.common import maybe_dictionarize
 from src.localize_utils import Localizer
 from src.utils import cosine_lr, LabelSmoothing
+from src.logging import get_logger
 
+client_logger = get_logger(__name__, "debug")
 
 class LocalUpdate(object):
     def __init__(self, args, sub_trainloader,trainable_params,n_shot,val_dataloader):
@@ -28,7 +30,7 @@ class LocalUpdate(object):
     def local_train(self, client_model):
         print_every = 100
         # devices = list(range(torch.cuda.device_count()))
-        print('Using devices',self.device)
+        client_logger.debug('Using devices '+str(self.device))
         # client_model = torch.nn.DataParallel(client_model, device_ids=devices)
         if self.args.lr > 0:
             loss_fn = LabelSmoothing(self.args.ls)
@@ -79,7 +81,7 @@ class LocalUpdate(object):
 
                 if step % print_every == 0 or i + 1 == n_batch:
                     percent_complete = 100 * i / len(self.trainloader)
-                    print(
+                    client_logger.debug(
                         f"Train Epoch: {epoch} [{percent_complete:.0f}% {i}/{len(self.trainloader)}]\t"
                         f"Loss: {loss.item():.6f}\tData (t) {data_time:.3f}\tBatch (t) {batch_time:.3f}", flush=True
                     )

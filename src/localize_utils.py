@@ -6,6 +6,9 @@ from src.datasets.common import maybe_dictionarize
 from src.heads import get_classification_head
 from src.modeling import ImageClassifier
 from src.utils import get_logits
+from src.logging import get_logger
+
+localize_logger = get_logger(__name__, "debug")
 
 
 class Localizer(nn.Module):
@@ -32,7 +35,7 @@ class Localizer(nn.Module):
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         self.model.to("cpu")
         if self.model_type == "vit":
-            print("Using Vision Transformer Classifier Head")
+            localize_logger.debug("Using Vision Transformer Classifier Head")
             self.classifier_head = classifier_head if classifier_head is not None else get_classification_head(
                 self.args, dataset_name)
             self.classifier_head.to("cpu")
@@ -75,7 +78,7 @@ class Localizer(nn.Module):
             # print(pretrained_state_dict[key].dtype)
             if key in self.pretrained_state_dict and key in self.finetuned_state_dict and self.pretrained_state_dict[
                 key].dtype in [torch.int64, torch.uint8]:
-                print(f"Key {key} has dtype {self.pretrained_state_dict[key].dtype} -- skipping!")
+                localize_logger.warning(f"Key {key} has dtype {self.pretrained_state_dict[key].dtype} -- skipping!")
                 continue
             self.task_vector[key] = (self.finetuned_state_dict[key] - self.pretrained_state_dict[key])
 
@@ -121,7 +124,7 @@ class Localizer(nn.Module):
         total_params = sum(
             [torch.sum(torch.round(torch.nn.Sigmoid()(p)) * torch.round(torch.nn.Sigmoid()(p))) / (1. * self.num_params)
              for p in basepatch.values()])
-        print('Total parameters in my stitch: ', total_params)
+        localize_logger.debug('Total parameters in my stitch: ' + str(total_params))
 
         return basepatch
 
@@ -147,7 +150,7 @@ class Localizer(nn.Module):
                     p += frac * (finetensor - pretensor)
 
         if round_:
-            print('Proportion in my graft: ', n_graft_params / self.num_params)
+            localize_logger.debug('Proportion in my graft: ' + str(n_graft_params / self.num_params))
 
         if return_mask:
             return binary_mask, n_graft_params / self.num_params
@@ -176,7 +179,7 @@ class Localizer(nn.Module):
             top1 = correct / n
 
         metrics = {'top1': top1}
-        print(f'Grafting on {dataset_name}. Accuracy: {100 * top1:.2f}%')
+        localize_logger.debug(f'Grafting on {dataset_name}. Accuracy: {100 * top1:.2f}%')
 
         return metrics
 
@@ -220,7 +223,7 @@ class Localizer(nn.Module):
             self.model_state_dict[key] = self.model_state_dict[key].to(device)
 
         for epoch in tqdm(range(self.graft_args.num_train_epochs), 'Training the mask'):
-            print("Epoch: ", epoch)
+            localize_logger.info("Graft Train Epoch: " + str(epoch))
             total_grad = {}
 
             self.interpolate_model(round_=True)
@@ -257,7 +260,6 @@ class Localizer(nn.Module):
                             total_grad[n] = lr * grad[n]
                         else:
                             total_grad[n] += lr * grad[n]
-
             for n in total_grad:
                 total_grad[n] /= len(dataloader)
 

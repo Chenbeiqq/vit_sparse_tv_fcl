@@ -14,7 +14,9 @@ from src.datasets.registry import get_dataset
 from src.heads import get_classification_head
 from src.localize_utils import Stitcher
 from src.modeling import ImageClassifier
+from src.logging import get_logger
 
+server_logger = get_logger(__name__, "debug")
 
 class vit_sparse_tv:
     def __init__(self, args, image_encoder, dataset_name, device, task_num, client,
@@ -60,7 +62,7 @@ class vit_sparse_tv:
             )
             metrics = self.do_eval(model, dataset.test_loader, self.device)
             accs.append(metrics['top1'])
-            print(f"Task eval on split {split_idx} of dataset {self.dataset_name}. Accuracy: {accs[-1]}")
+            server_logger.info(f"Task eval on split {split_idx} of dataset {self.dataset_name}. Accuracy: {accs[-1]}")
 
         return accs
 
@@ -129,14 +131,14 @@ class vit_sparse_tv:
 
             # 保存到Excel
             updated_df.to_excel(excel_path, index=False)
-            print(f"统计数据已保存到 {excel_path}")
+            server_logger.info(f"统计数据已保存到 {excel_path}")
 
         except Exception as e:
-            print(f"保存Excel时发生错误: {str(e)}")
+            server_logger.error(f"保存Excel时发生错误: {str(e)}")
             # 尝试使用备份文件名保存
             backup_path = f'sparse_merge_stats_backup_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
             new_df.to_excel(backup_path, index=False)
-            print(f"已保存备份文件到 {backup_path}")
+            server_logger.info(f"已保存备份文件到 {backup_path}")
 
     def setup_data(self, n_shot):
         assert self.dataset_name is not None, "please provide a dataset for training"
@@ -151,12 +153,12 @@ class vit_sparse_tv:
     def setup_task_data_and_classification_head(self, current_task):
         # 检查是否已存在过去训练的image_encoder,要做到sequential finetuning
         if os.path.exists(os.path.join(self.global_image_encoder_ft, f'image_encoder_{current_task}.pt')):
-            print(f"Skipping finetuning on split {current_task}, "
+            server_logger.info(f"Skipping finetuning on split {current_task}, "
                   f"ckpt already exists under {os.path.join(self.global_image_encoder_ft, f'image_encoder_{current_task}.pt')}")
             return True
         if current_task > 0:
             prev_image_encoder_ft = os.path.join(self.global_image_encoder_ft, f'image_encoder_{current_task - 1}.pt')
-            print(f'Loading image encoder from prev task {prev_image_encoder_ft=}')
+            server_logger.debug(f'Loading image encoder from prev task {prev_image_encoder_ft=}')
             self.global_image_encoder = torch.load(prev_image_encoder_ft, weights_only=False)
             # denote  pass this task process
         dataset = copy.deepcopy(self.dataset)
@@ -189,7 +191,7 @@ class vit_sparse_tv:
         user_groups_valloader = map_dict_val
 
         for idx in idxs_users:
-            print(f'client {idx} in {self.dataset_name}-task{current_task}')
+            server_logger.info(f'client {idx} in {self.dataset_name}-task{current_task}')
             client_start_time = datetime.now()
 
             client = LocalUpdate(self.args, user_groups_loader[idx], self.trainable_params, n_shot=self.args.n_shot,
@@ -200,7 +202,7 @@ class vit_sparse_tv:
             self.client_sparse_tv.append(local_model)
 
             client_end_time = datetime.now()
-            print(
+            server_logger.debug(
                 f'client {idx} in {self.dataset_name}-task{current_task} cost time: {client_end_time - client_start_time}')
             # self.client_sparse_tv.append(client.local_train(client_model))
 
@@ -224,12 +226,13 @@ class vit_sparse_tv:
         self.save_checkpoint(current_task)
 
     def afterTrain(self, current_task):
-        print('#' * 100 + "\nPerforming old task evaluation of federated continual learning .")
+        server_logger.info('#' * 100 + "\nPerforming old task evaluation of federated continual learning .")
         results = []
-        print(
+        server_logger.info(
             f"\nEVAL: {self.dataset_name}-{self.args.n_splits} (federated {self.args.split_strategy} incremental) - split idx: {current_task}")
         res = self.federated_class_continual_eval(current_task)
         results.append(res)
-        print(f" eval on {self.dataset_name} after task {current_task}. Accuracies:\n{res}")
+        server_logger.info(f" eval on {self.dataset_name} after task {current_task}. Accuracies:\n{res}")
 
-        print(f" evaluation  final results:\n{results}\n" + '#' * 100 + '\n')
+        server_logger.info(f" evaluation  final results:\n{results}\n" + '#' * 100 + '\n')
+        return results
